@@ -1,40 +1,37 @@
-# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""A sample plugin to demonstrate reading scalars."""
-
-
 import mimetypes
 import os
+import glob
 
-from werkzeug import wrappers
+import tensorflow as tf
+
+import werkzeug
+from werkzeug import exceptions, wrappers
 
 from tensorboard import errors
 from tensorboard import plugin_util
 from tensorboard.backend import http_util
+from tensorboard.backend.event_processing import event_accumulator
 from tensorboard.data import provider
 from tensorboard.plugins import base_plugin
 from tensorboard.plugins.scalar import metadata
 
-_SCALAR_PLUGIN_NAME = metadata.PLUGIN_NAME
-_PLUGIN_DIRECTORY_PATH_PART = "/data/plugin/example_raw_scalars/"
+def decorate_headers(func):
+    def wrapper(*args, **kwargs):
+        headers = func(*args, **kwargs)
+        headers.extend(TensorboardPlugin3D.headers)
+        return headers
+    return wrapper
+
+exceptions.HTTPException.get_headers = decorate_headers(exceptions.HTTPException.get_headers)
+
+_PLUGIN_DIRECTORY_PATH_PART = "/data/plugin/tensorboard_plugin_3d/"
 
 
-class ExampleRawScalarsPlugin(base_plugin.TBPlugin):
-    """Raw summary example plugin for TensorBoard."""
+class TensorboardPlugin3D(base_plugin.TBPlugin):
+    """TensorBoard plugin for 3D rendering."""
 
-    plugin_name = "example_raw_scalars"
+    plugin_name = "tensorboard_plugin_3d"
+    headers = [("X-Content-Type-Options", "nosniff")]
 
     def __init__(self, context):
         """Instantiates ExampleRawScalarsPlugin.
@@ -43,13 +40,25 @@ class ExampleRawScalarsPlugin(base_plugin.TBPlugin):
           context: A base_plugin.TBContext instance.
         """
         self._data_provider = context.data_provider
+        self._logdir = context.logdir
 
     def get_plugin_apps(self):
         return {
-            "/scalars": self.scalars_route,
+            "/index.js": self._serve_static_file,
+            "/index.html": self._serve_static_file,
+            "/images": self._serve_image,
             "/tags": self._serve_tags,
-            "/static/*": self._serve_static_file,
         }
+
+    @wrappers.Request.application
+    def _serve_image(self, request):
+        response = {'images': []}
+        for eis in self._images:
+            np_arr = tf.io.decode_image(eis).numpy()
+            if np_arr.ndim == 4:
+                np_arr = np_arr[:,:,:,0]
+            response['images'].append({'array': np_arr.tolist()})
+        return http_util.Respond(request, response, "application/json")
 
     @wrappers.Request.application
     def _serve_tags(self, request):
@@ -75,37 +84,56 @@ class ExampleRawScalarsPlugin(base_plugin.TBPlugin):
         """Returns a resource file from the static asset directory.
 
         Requests from the frontend have a path in this form:
-        /data/plugin/example_raw_scalars/static/foo
+        /data/plugin/tensorboard_plugin_3d/static/foo
         This serves the appropriate asset: ./static/foo.
 
         Checks the normpath to guard against path traversal attacks.
         """
-        static_path_part = request.path[len(_PLUGIN_DIRECTORY_PATH_PART) :]
-        resource_name = os.path.normpath(
-            os.path.join(*static_path_part.split("/"))
+        filename = os.path.basename(request.path)
+        extension = os.path.splitext(filename)[1]
+        if extension == '.html':
+            mimetype = 'text/html'
+        elif extension == '.css':
+            mimetype = 'text/css'
+        elif extension == '.js':
+            mimetype = 'application/javascript'
+        else:
+            mimetype = 'application/octet-stream'
+        filepath = os.path.join(os.path.dirname(__file__), 'static', filename)
+        try:
+            with open(filepath, 'rb') as infile:
+                contents = infile.read()
+        except IOError:
+            raise exceptions.NotFound("404 Not Found")
+        return werkzeug.Response(
+            contents, content_type=mimetype, headers=TensorboardPlugin3D.headers
         )
-        if not resource_name.startswith("static" + os.path.sep):
-            return http_util.Respond(
-                request, "Not found", "text/plain", code=404
-            )
 
-        resource_path = os.path.join(os.path.dirname(__file__), resource_name)
-        with open(resource_path, "rb") as read_file:
-            mimetype = mimetypes.guess_type(resource_path)[0]
-            return http_util.Respond(
-                request, read_file.read(), content_type=mimetype
-            )
+    def _find_all_images(self):
+        self._images = []
+        events = sorted(glob.glob(os.path.join(self._logdir, '*')))
+        for event in events:
+            ea = event_accumulator.EventAccumulator(event)
+            ea.Reload()
+            tags = ea.Tags()['images']
+            for tag in tags:
+                for image in ea.Images(tag):
+                    self._images.append(image.encoded_image_string)
+        return len(self._images)
 
     def is_active(self):
         """Returns whether there is relevant data for the plugin to process.
-
-        When there are no runs with scalar data, TensorBoard will hide the plugin
-        from the main navigation bar.
+        If there is no any pending run, hide the plugin
         """
-        return True
+        images_available = self._find_all_images()
+        return images_available
 
     def frontend_metadata(self):
-        return base_plugin.FrontendMetadata(es_module_path="/static/index.js")
+        return base_plugin.FrontendMetadata(
+            es_module_path="/index.js",
+            disable_reload=True,
+            tab_name="Tensorboard 3D"
+        )
 
     def scalars_impl(self, ctx, experiment, tag, run):
         """Returns scalar data for the specified tag and run.
